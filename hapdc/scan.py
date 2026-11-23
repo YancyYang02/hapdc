@@ -22,7 +22,7 @@ import time
 import numpy as np
 import scipy.linalg as _sla
 
-from .core import (acat, check_fixed_effects, f2p, jitter_blocks, lambda_gc,
+from .core import (AnalysisFailed, acat, check_fixed_effects, standardize_covariates, f2p, jitter_blocks, lambda_gc,
                    ld_blocks, reml_delta, t2p, window_design, windows)
 
 __all__ = ["Scan"]
@@ -45,14 +45,29 @@ def _prep_scale(U, S, y, covar=None):
     `covar` (n, c) adds fixed-effect covariates (e.g. principal components) to
     the intercept; `one` is then the whitened (n, 1 + c) fixed-effect design.
     `covar` must already be of full column rank together with the intercept
-    (Scan checks it with core.check_fixed_effects before calling this)."""
+    (Scan checks it with core.check_fixed_effects before calling this). The
+    covariates are centred and divided by their standard deviation before the
+    rotation (core.standardize_covariates).
+    Raises core.AnalysisFailed if y has no variation or if there are no
+    residual degrees of freedom."""
     n = len(y)
     Ut = U.T
     yr = Ut @ y
     if covar is None or np.asarray(covar).size == 0:
         Xr = Ut @ np.ones(n)
     else:
-        Xr = Ut @ np.column_stack([np.ones(n), np.asarray(covar, float)])
+        # [1, standardised covariates] spans the same space as [1, covar]; the
+        # fit, residuals and p-values are the same, but do not depend on the
+        # location or units of the covariates.
+        Z = standardize_covariates(np.asarray(covar, float))[0]
+        Xr = Ut @ np.column_stack([np.ones(n), Z])
+    q = 1 if Xr.ndim == 1 else Xr.shape[1]
+    if not np.isfinite(y).all():
+        raise AnalysisFailed("phenotype contains non-finite values")
+    if np.ptp(y) == 0:
+        raise AnalysisFailed("phenotype has no variation in the %d analysed samples" % n)
+    if n - q < 2:
+        raise AnalysisFailed("no residual degrees of freedom (n=%d, %d fixed effects)" % (n, q))
     dlt = reml_delta(yr, S, Xr)
     w = 1.0 / np.sqrt(S + dlt)
     one = Xr * w if Xr.ndim == 1 else Xr * w[:, None]
@@ -325,7 +340,7 @@ class Scan:
             rss1 = (RY * RY).sum(0)
             df2 = n - k
             dfa = k - nf
-            if dfa > 0:
+            if dfa > 0 and df2 > 0:
                 F = ((rss0 - rss1) / dfa) / (rss1 / df2)
                 P["A_joint"][c] = np.clip(f2p(F, dfa, df2), 1e-300, 1.0)
                 V["A_joint"][c] = True
@@ -355,7 +370,7 @@ class Scan:
                                        else acat(pao, np.ones(pao.shape[0])))
                     V["P1_acat"][c] = True
             # --- diplotype test (D_acat): cells of the joint genotype, ACAT over cells
-            if do_dac and d["ncell"] > 1:
+            if do_dac and d["ncell"] > 1 and df2 > 1:
                 Xc0 = Uc * self.w[:, None]
                 Xc = Xc0 - Q @ (Q.T @ Xc0)
                 ncx = (Xc * Xc).sum(0)

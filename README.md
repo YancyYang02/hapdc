@@ -2,6 +2,9 @@
 
 Multi-scale haplotype and diplotype scan for genome-wide association.
 
+Identifier alignment and implementation details are documented in
+[REPRODUCTION_DETAILS.md](REPRODUCTION_DETAILS.md).
+
 `hapdc` tests the joint effect of the haplotype and diplotype configuration of
 a genomic region on a quantitative or binary trait, in a linear mixed model
 that accounts for population structure through a genomic relationship matrix.
@@ -38,6 +41,14 @@ matrix into one directory. `ms` reads that directory and writes, for the trait
 named in the phenotype header, `<trait>.anchors.tsv` and
 `<trait>.summary.json`. `--jobs N` scans N chromosomes in parallel and returns
 the same result as `--jobs 1` (parallel mode uses `fork`, so Linux or macOS).
+`--chrom 1,2` restricts the scan; `1` and `chr1` name the same chromosome, and
+a name not present in the data stops the run.
+
+Exit codes: 0 completed; 1 input error (for example a repeated or ambiguous
+sample identifier); 2 the trait could not be analysed (constant phenotype, too
+few samples, a non-finite statistic). On exit code 2 `ms` writes
+`<trait>.summary.json` with `"status": "FAILED"`, a `reason` and `n_sig`
+null, and no anchor table; a completed run has `"status": "completed"`.
 
 ## Output
 
@@ -46,7 +57,7 @@ the same result as `--jobs 1` (parallel mode uses `fork`, so Linux or macOS).
 | column | meaning |
 | --- | --- |
 | `chrom`, `start_bp`, `end_bp`, `n_markers` | anchor position and size |
-| `P` | anchor p-value (statistic D, combined over the seven scales) |
+| `P` | anchor p-value (statistic D, combined over the seven scales), written with 17 significant digits so that it reads back as the same double |
 | `lead_scale`, `lead_unit_start`, `lead_unit_end` | scale and position of the unit with the smallest p-value |
 | `P_nonadditive` | scale-weighted ACAT of the `NADD_F` p-values in the anchor: departure from additivity *of the grouped haplotype classes* (after rare-haplotype reassignment), not a test against every additive SNP model (see "What is tested") |
 | `sig_bonf` | 1 if `P` < 0.05 / number of anchors |
@@ -61,6 +72,23 @@ are keyed by absolute path plus MD5, so files with the same name in different
 directories are all recorded). `hapdc merge` also lists, per input table, the
 trait, sample size, transform, covariates, hapdc version and key options read
 from the table's own `summary.json`.
+
+`hapdc merge PREFIX TABLE...` combines per-chromosome tables and recomputes the
+Bonferroni threshold over all anchors. The output is `PREFIX.anchors.tsv` and
+`PREFIX.summary.json`; if the name already ends in `.tsv` (for example
+`all.tsv` or `all.anchors.tsv`) the table is written there and the summary
+next to it with the `.tsv` or `.anchors.tsv` suffix replaced by
+`.summary.json`. Tables that store P at 4 or fewer significant
+digits are still accepted; `merge` prints a warning and lists them under
+`low_precision_tables`, because an anchor next to the threshold may then be
+classified differently from the full-precision value. A shard whose
+`summary.json` records `FAILED` is not merged. The summary of each input table
+is looked up with the same naming rule (`a.anchors.tsv`, `a.tsv` and `a` all
+use `a.summary.json`; `a.b.tsv` uses `a.b.summary.json`).
+
+`hapdc report SCAN_DIR...` draws Manhattan and QQ SVGs from the output of
+`hapdc scan` (`scan_ld.npz` for LD units, the default, or `scan_w<width>.npz`
+for fixed windows). It does not read `ms` anchor tables.
 
 ### Reading lambda_gc
 
@@ -78,29 +106,50 @@ threshold under "Thresholds".
 ## Inputs
 
 * **Genotypes** -- a phased, biallelic VCF (`0|1`). A marker is dropped, and
-  counted under its reason in the `prep` log, if any sample has a missing call,
-  an unphased heterozygote (`0/1`), a haploid call, or an allele index other
-  than 0/1 (split multi-allelic sites with `bcftools norm -m-` first), or if it
-  does not vary. Unphased homozygotes (`0/0`, `1/1`) carry no phase information
-  and are accepted. Genotypes are read as 0/1 haplotypes, two rows per individual.
+  counted under its reason in the `prep` log and `meta.json`, if any sample has
+  a missing call, a haploid call, or an allele index other than 0/1 (split
+  multi-allelic sites with `bcftools norm -m-` first), or if it does not vary.
+  An unphased heterozygote (`0/1`, `1/0`) stops `prep` with exit code 1 and
+  names the marker and sample, because its haplotypes are unknown; phase the
+  VCF before `prep`, or pass `--skip-unphased` to drop every such marker (counted under
+  `unphased`; `meta.json` records `unphased_policy`). Unphased homozygotes
+  (`0/0`, `1/1`) are unambiguous and are accepted. Genotypes are read as 0/1 haplotypes, two rows per individual.
 * **Relationship matrix** -- either a GCTA `.grm` prefix, or `auto` to compute
   a VanRaden GRM from the VCF itself (`--grm-thin` markers are used).
-* **Phenotypes** -- a table whose first column is the individual ID and whose
-  remaining columns are traits, one column per trait, missing values coded
-  `-9` by default (`--miss`). Numeric covariates, for example leading principal
-  components or batch indicators, go in a separate file passed to `hapdc ms
-  --covar`, one header line, IID followed by numeric columns. The intercept is
+* **Sample identifiers** -- samples are matched by IID. Every identifier must
+  occur once in the VCF header, in the GRM `.grm.id` file (as an FID, IID pair),
+  in the phenotype table and in the covariate table; a repeated identifier stops
+  `prep` or `ms` with exit code 1 and names it. If a GRM uses the same IID under
+  different FIDs, name the VCF samples `FID_IID` and give the phenotype and
+  covariate tables a `FID IID` header; samples are then matched on the composite
+  key. Without that, the run stops rather than guess. The `.grm.bin` size must
+  equal n(n+1)/2 values.
+* **Phenotypes** -- a table whose first column is the individual ID (or FID,
+  IID with a `FID IID` header) and whose remaining columns are traits, one
+  column per trait, missing values coded `-9` by default (`--miss`). Numeric
+  covariates, for example leading principal components or batch indicators, go
+  in a separate file passed to `hapdc ms --covar`, one header line, IID (or FID,
+  IID) followed by numeric columns. The intercept is
   always added; do not include a column of ones. For a categorical covariate
   with L levels supply L - 1 indicator columns.
 * **Covariate rank check** -- before the variance components are fitted, the
   design [intercept, covariates] is checked on the samples actually analysed
   (after removing samples with a missing phenotype or covariate). Columns are
-  examined in file order; a column that is constant, duplicates an earlier
-  column, or is a linear combination of the intercept and earlier columns
-  (relative tolerance 1e-8 on unit-norm columns) is dropped and logged
+  examined in file order after each is centred and divided by its standard
+  deviation, so adding a constant to a covariate or changing its units changes
+  neither the rank decision nor any p-value. A column that is constant,
+  duplicates an earlier column up to location and scale, or is a linear
+  combination of the intercept and earlier columns (residual norm at most
+  max(1e-8, 64 eps max|x| / sd) on unit-norm columns, the second term being the
+  precision of a column stored with a large offset) is dropped and logged
   (`--covar-rank drop`, default) or stops the run with the offending column
-  names (`--covar-rank error`). Dropped columns are listed in `summary.json`.
-  A covariate that is nearly, but not exactly, collinear is kept.
+  names (`--covar-rank error`). Dropped columns, and the mean and standard
+  deviation used for each kept column (`covariate_transform`), are listed in
+  `summary.json`. A covariate that is nearly, but not exactly, collinear is
+  kept; the REML fit and the fixed-effect projection use the standardised
+  design with an orthogonal (QR) decomposition. A phenotype with no variation,
+  or with no residual degrees of freedom after the fixed effects, is refused
+  (exit code 2).
 
 ## What is tested
 

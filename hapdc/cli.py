@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -78,7 +79,8 @@ def _provenance(a, files, roles=None):
 # ---------------------------------------------------------------- prep
 def cmd_prep(a):
     _mkout(a.out)
-    ids, H, meta, dropped = io.read_vcf(a.vcf, a.nmax)
+    ids, H, meta, dropped = io.read_vcf(a.vcf, a.nmax,
+                                        unphased="skip" if getattr(a, "skip_unphased", False) else "error")
     if a.grm == "auto":
         # VanRaden GRM from every --grm-thin-th marker (MAF > 0.01)
         G = (H[0::2, ::a.grm_thin] + H[1::2, ::a.grm_thin]).astype(np.float32)
@@ -87,14 +89,20 @@ def cmd_prep(a):
         gids, K = list(ids), (Z @ Z.T / Z.shape[1]).astype(float)
         print("GRM computed from %d markers" % Z.shape[1], flush=True)
     else:
-        gids, K = io.read_grm(a.grm)
+        gids, K, gfids = io.read_grm(a.grm, return_fid=True)
     vids = list(ids)
-    keep_ids = [g for g in gids if g in vids]
-    order = [vids.index(g) for g in keep_ids]
+    # one-to-one sample mapping; repeated identifiers stop here (io.match_ids)
+    if a.grm == "auto":
+        keep_ids, order, gorder = list(vids), list(range(len(vids))), list(range(len(vids)))
+        id_mode = "iid"
+    else:
+        keep_ids, order, gorder, id_mode = io.match_ids(vids, gids, gfids, return_mode=True)
+    if not keep_ids:
+        raise SystemExit("no sample of the VCF is in the GRM")
     m = H.shape[1]
     # H is (n_hap, m); rows 2j, 2j+1 are the two haplotypes of sample j
     H = np.ascontiguousarray(H.reshape(len(vids), 2, m)[order, :, :].reshape(2 * len(order), m))
-    K = K[np.ix_([gids.index(g) for g in keep_ids], [gids.index(g) for g in keep_ids])]
+    K = K[np.ix_(gorder, gorder)]
     n = len(keep_ids)
     S, U = np.linalg.eigh(K)
     S = np.clip(S, 1e-6, None)
@@ -106,7 +114,7 @@ def cmd_prep(a):
     names = []
     for p in a.pheno.split(","):
         # every trait column of every file; a two-column file keeps its file stem as the trait name
-        Yp, hn = io.read_pheno_table(p, keep_ids, miss=miss_codes)
+        Yp, hn = io.read_pheno_table(p, keep_ids, miss=miss_codes, id_mode=id_mode)
         names += [os.path.splitext(os.path.basename(p))[0]] if Yp.shape[1] == 1 else list(hn)
         Y.append(Yp)
     Y = np.column_stack(Y)
@@ -117,7 +125,8 @@ def cmd_prep(a):
     np.save(os.path.join(a.out, "traits.npy"), Y[ok])
     np.save(os.path.join(a.out, "keep.npy"), np.where(ok)[0])
     json.dump(dict(ids=[keep_ids[i] for i in np.where(ok)[0]], traits=names,
-                   n=int(ok.sum()), m=int(m), dropped=dropped,
+                   n=int(ok.sum()), m=int(m), dropped=dropped, sample_id_mode=id_mode,
+                   unphased_policy="skip" if getattr(a, "skip_unphased", False) else "error",
                    vcf=os.path.abspath(a.vcf), grm=os.path.abspath(a.grm)),
               open(os.path.join(a.out, "meta.json"), "w"), indent=1)
     json.dump([[list(x) for x in meta]], open(os.path.join(a.out, "markers.json"), "w"))
@@ -207,19 +216,20 @@ def cmd_scan(a):
 
 
 # ---------------------------------------------------------------- ms (primary analysis)
-def _read_covar(path, ids):
-    """Tab-separated table, header line, first column IID, remaining columns numeric."""
-    tab = {}
-    with open(path) as f:
-        hdr = f.readline().rstrip("\n").split("\t")
-        for ln in f:
-            p = ln.rstrip("\n").split("\t")
-            try:
-                tab[p[0]] = [float(x) for x in p[1:len(hdr)]]
-            except ValueError:
-                tab[p[0]] = [np.nan] * (len(hdr) - 1)
-    k = len(hdr) - 1
-    return np.array([tab.get(i, [np.nan] * k) for i in ids], float), hdr[1:]
+def _read_covar(path, ids, id_mode="auto"):
+    """Header line, first column IID (or FID, IID), remaining columns numeric.
+    A row with a non-numeric entry is missing; a repeated identifier is an error."""
+    hdr, rows = io.read_keyed_table(path, ids, "covariate file", id_mode=id_mode)
+    k = len(hdr)
+    C = np.full((len(ids), k), np.nan)
+    for i, p in enumerate(rows):
+        if p is None:
+            continue
+        try:
+            C[i] = [float(x) for x in p[:k]] + [np.nan] * (k - len(p[:k]))
+        except ValueError:
+            pass
+    return C, hdr
 
 
 # lambda_gc of `ms` anchor p-values is below 1 under the null (the Cauchy
@@ -278,13 +288,78 @@ def _ms_chrom(ch):
     return ch, rows, len(cols), len(anc)
 
 
+def _chrom_key(c):
+    c = str(c)
+    return c[3:] if c[:3].lower() == "chr" else c
+
+
+def _select_chroms(present, wanted):
+    """Chromosomes of the data named by --chrom; "1" and "chr1" name the same one.
+    A name that matches nothing is an error (an empty scan is never silent)."""
+    present = [str(c) for c in present]
+    if wanted is None:
+        return present
+    w = [x.strip() for x in str(wanted).split(",") if x.strip()]
+    keys = {}
+    for c in present:
+        keys.setdefault(_chrom_key(c), []).append(c)
+    amb = [k for k, v in keys.items() if len(v) > 1]
+    if amb:
+        raise SystemExit("chromosome names %s differ only by a 'chr' prefix in the data"
+                         % [keys[k] for k in amb])
+    miss = [x for x in w if _chrom_key(x) not in keys]
+    if miss:
+        raise SystemExit("--chrom %s: not in the data (chromosomes: %s)" % (",".join(miss), ",".join(present)))
+    sel = {keys[_chrom_key(x)][0] for x in w}
+    return [c for c in present if c in sel]
+
+
+def _check_trait(y, q, name):
+    """Refuse a trait that cannot be analysed: no variation, too few samples for
+    the fixed effects, or non-finite values (core.AnalysisFailed)."""
+    y = np.asarray(y, float)
+    if len(y) == 0:
+        raise core.AnalysisFailed("trait %s: no samples with a phenotype" % name)
+    if not np.isfinite(y).all():
+        raise core.AnalysisFailed("trait %s: non-finite phenotype values" % name)
+    if np.ptp(y) == 0:
+        raise core.AnalysisFailed("trait %s: phenotype has no variation in the %d analysed samples (all %g)"
+                                  % (name, len(y), y[0]))
+    if len(y) - q < 2:
+        raise core.AnalysisFailed("trait %s: no residual degrees of freedom (n=%d, %d fixed effects)"
+                                  % (name, len(y), q))
+
+
+EXIT_FAILED = 2
+
+
 def cmd_ms(a):
+    """Multi-scale anchor scan; a trait that cannot be analysed is recorded as
+    FAILED (summary.json status, no anchor table) and gives exit status 2."""
+    try:
+        return _cmd_ms(a)
+    except core.AnalysisFailed as e:
+        tname = getattr(a, "_tname", None) or a.trait_name or str(a.trait)
+        out = _mkout(a.out)
+        json.dump(dict(trait=tname, status="FAILED", reason=str(e), n_sig=None, lambda_gc=None,
+                       provenance=_provenance(a, [os.path.join(a.data, "meta.json")], roles=["prep"])),
+                  open(os.path.join(out, "%s.summary.json" % tname), "w"), indent=1)
+        stale = os.path.join(out, "%s.anchors.tsv" % tname)
+        if os.path.exists(stale):
+            os.replace(stale, stale + ".stale")
+        print("FAILED: %s" % e, file=sys.stderr, flush=True)
+        print("ms FAILED: trait %s -> %s" % (tname, os.path.join(out, "%s.summary.json" % tname)), flush=True)
+        return EXIT_FAILED
+
+
+def _cmd_ms(a):
     """Multi-scale anchor scan with unit statistic D; Bonferroni over anchors."""
     from . import ms as M
     import time
     out = _mkout(a.out)
     meta_j = json.load(open(os.path.join(a.data, "meta.json")))
     ids = meta_j["ids"]
+    io.check_unique(ids, "prep %s" % os.path.join(a.data, "meta.json"))
     Hall = np.load(os.path.join(a.data, "hap.npy"), mmap_mode="r")
     Y = np.load(os.path.join(a.data, "traits.npy"))
     K = np.load(os.path.join(a.data, "K_keep.npy")).astype(float)
@@ -294,19 +369,23 @@ def cmd_ms(a):
     C = None
     cnames = []
     if a.covar:
-        C, cnames = _read_covar(a.covar, ids)
+        C, cnames = _read_covar(a.covar, ids, id_mode=meta_j.get("sample_id_mode", "auto"))
         print("covariates:", cnames, flush=True)
     ok = np.isfinite(y) & (np.isfinite(C).all(1) if C is not None else True)
     idx = np.where(ok)[0]
     covar_dropped = []
+    covar_info = None
     if C is not None:
         # Rank check of [intercept, covariates] on the samples actually analysed,
         # before any REML fit: a constant column (e.g. a level that became
         # constant after removing missing phenotypes, or a user-supplied
         # intercept) or a duplicated / linearly dependent column is dropped
         # (--covar-rank drop, default) or rejected (--covar-rank error).
-        Ck, kn, covar_dropped = core.check_fixed_effects(C[idx], len(idx), names=cnames,
-                                                         policy=a.covar_rank)
+        # The intercept is kept on its own; the covariates are centred and
+        # scaled before the decision (core.check_fixed_effects), so shifting a
+        # covariate by a constant or changing its units changes nothing.
+        Ck, kn, covar_dropped, covar_info = core.check_fixed_effects(
+            C[idx], len(idx), names=cnames, policy=a.covar_rank, return_info=True)
         for d_ in covar_dropped:
             print("covariate %s dropped before REML: %s" % (d_["name"], d_["reason"]), flush=True)
         if Ck is None:
@@ -320,8 +399,9 @@ def cmd_ms(a):
     S = np.clip(S, 1e-6, None)
     hrow = np.sort(np.concatenate([2 * keep_rows[idx], 2 * keep_rows[idx] + 1]))
     chrom = np.array([str(x[0]) for x in markers]); pos = np.array([int(x[2]) for x in markers])
-    chroms = [str(c) for c in dict.fromkeys(chrom.tolist()) if a.chrom is None or c in a.chrom.split(",")]
+    chroms = _select_chroms(list(dict.fromkeys(chrom.tolist())), a.chrom)
     tname = a.trait_name or meta_j["traits"][a.trait]
+    a._tname = tname
     print("trait %s: n=%d of %d, chromosomes %s" % (tname, len(idx), len(ids), chroms), flush=True)
     yt = y[idx].copy()
     if a.transform == "int" and len(np.unique(yt)) > 2:
@@ -340,8 +420,13 @@ def cmd_ms(a):
     # the scan's anchor p-values are then not calibrated. With --kernel-power auto
     # the selected K^g is used (sensitivity analysis; it can absorb
     # population-differentiated loci into the random effect).
-    Xk = np.ones(len(idx)) if C is None else np.column_stack([np.ones(len(idx)), C[idx]])
+    q_fix = 1 + (0 if C is None else C.shape[1])
+    _check_trait(yt, q_fix, tname)
+    Xk = (np.ones(len(idx)) if C is None else
+          np.column_stack([np.ones(len(idx)), core.standardize_covariates(C[idx])[0]]))
     kp_sel, kp_lrt, _tab = core.kernel_power(U.T @ yt, S, U.T @ Xk)
+    if not np.isfinite(kp_lrt):
+        raise core.AnalysisFailed("kernel diagnostic is not finite")
     kp_g = 1.0
     print("kernel diagnostic: REML-best g=%.2f, LRT vs g=1 = %.2f" % (max(_tab, key=lambda t: t[1])[0], kp_lrt), flush=True)
     if getattr(a, "kernel_power", "1") == "auto" and kp_sel != 1.0:
@@ -372,6 +457,10 @@ def cmd_ms(a):
         for ch in chroms:
             rows += res[ch]
     NA = len(rows)
+    nonfin = [r_ for r_ in rows if not np.isfinite(r_[4])]
+    if nonfin:
+        raise core.AnalysisFailed("%d of %d anchor p-values are not finite (first: %s:%d-%d)"
+                                  % (len(nonfin), NA, nonfin[0][0], nonfin[0][1], nonfin[0][2]))
     n_tests = int(a.n_tests) if a.n_tests else NA
     if a.chrom is not None and not a.n_tests:
         print("WARNING: --chrom scans a subset; the Bonferroni threshold below uses only its %d anchors. "
@@ -395,13 +484,16 @@ def cmd_ms(a):
     with open(path, "w") as f:
         f.write("chrom\tstart_bp\tend_bp\tn_markers\tP\tlead_scale\tlead_unit_start\tlead_unit_end\tP_nonadditive\tsig_bonf\n")
         for rw in rows:
-            f.write("%s\t%d\t%d\t%d\t%.4g\t%s\t%d\t%d\t%.4g\t%d\n" % (rw + (int(rw[4] < thr),)))
-    json.dump(dict(trait=tname, n=int(len(idx)), n_anchors=NA, n_tests_bonf=n_tests, chrom=a.chrom, threshold_bonf=thr, n_sig=int(sum(r_[4] < thr for r_ in rows)),
+            # 17 significant digits: the table round-trips to the in-memory
+            # double, so `merge` and any reader reach the same decisions.
+            f.write("%s\t%d\t%d\t%d\t%.17g\t%s\t%d\t%d\t%.17g\t%d\n" % (rw + (int(rw[4] < thr),)))
+    json.dump(dict(trait=tname, status="completed", n=int(len(idx)), n_anchors=NA, n_tests_bonf=n_tests, chrom=a.chrom, threshold_bonf=thr, n_sig=int(sum(r_[4] < thr for r_ in rows)),
                    lambda_gc=_lam, lambda_ref=(list(lam_ref) if lam_ref is not None else None),
                    anchor_min=a.anchor_min,
                    kernel_power=kp_g, kernel_power_lrt=kp_lrt, kernel_power_best=float(max(_tab, key=lambda t: t[1])[0]),
                    ld_dmin=a.ld_dmin, ld_maxspan=a.ld_maxspan, ld_hapcover=a.ld_hapcover, minf=a.minf, minc=a.minc,
                    covar=a.covar, covariates_used=cnames, covariates_dropped=covar_dropped,
+                   covariate_transform=covar_info,
                    covar_rank_policy=a.covar_rank, transform=("int" if (a.transform == "int" and len(np.unique(y[idx])) > 2) else "none"),
                    kernel_power_option=a.kernel_power, n_tests_source=("--n-tests" if a.n_tests else "anchors scanned"),
                    elapsed_s=round(time.time() - t0, 1),
@@ -415,6 +507,38 @@ def cmd_ms(a):
 
 
 # ---------------------------------------------------------------- merge
+def _merge_paths(out):
+    """(anchor table, summary) paths of `merge`: PREFIX -> PREFIX.anchors.tsv and
+    PREFIX.summary.json; NAME.anchors.tsv -> NAME.summary.json; any other
+    NAME.tsv -> NAME.summary.json (the real suffix is removed, never a fixed length)."""
+    p = Path(out)
+    if p.name.endswith(".anchors.tsv"):
+        stem = p.name[:-len(".anchors.tsv")]
+        tab = p
+    elif p.suffix == ".tsv":
+        stem, tab = p.stem, p
+    else:
+        stem, tab = p.name, p.with_name(p.name + ".anchors.tsv")
+    if not stem:
+        raise SystemExit("merge output name %s has no stem" % out)
+    return str(tab), str(p.with_name(stem + ".summary.json"))
+
+
+def _p_digits(path, ip):
+    """Largest number of significant digits among the P entries of a table."""
+    best = 0
+    with open(path) as f:
+        f.readline()
+        for ln in f:
+            p = ln.rstrip("\n").split("\t")
+            if len(p) > ip:
+                m = p[ip].lower().split("e")[0].replace("-", "").replace(".", "").lstrip("0")
+                best = max(best, len(m))
+                if best > 4:
+                    break
+    return best
+
+
 def cmd_merge(a):
     """Combine per-chromosome `ms` anchor tables of one trait; genome-wide Bonferroni."""
     hdr, rows = None, []
@@ -431,14 +555,22 @@ def cmd_merge(a):
         raise SystemExit("the same anchor appears in more than one table; pass each chromosome once")
     ip, isg = hdr.index("P"), hdr.index("sig_bonf")
     P = np.array([float(r[ip]) for r in rows])
+    if not np.isfinite(P).all():
+        raise SystemExit("non-finite P in the input tables; a FAILED trait has no anchor table")
+    if not len(P):
+        raise SystemExit("no anchors in the input tables")
+    if ((P < 0) | (P > 1)).any():
+        raise SystemExit("P in the input tables must lie in [0, 1]")
+    # tables holding P at 4 significant digits: a p-value next
+    # to the threshold may then fall on the other side of it
+    low_prec = [p for p in a.tables if _p_digits(p, ip) <= 4]
     thr = a.alpha / len(rows)
     for r, pv in zip(rows, P):
         r[isg] = str(int(pv < thr))
-    out = a.out if a.out.endswith(".tsv") else a.out + ".anchors.tsv"
-    with open(out, "w") as f:
-        f.write("\t".join(hdr) + "\n")
-        for r in rows:
-            f.write("\t".join(r) + "\n")
+    out, sum_path = _merge_paths(a.out)
+    src = {os.path.realpath(os.path.abspath(p)) for p in a.tables}
+    if {os.path.realpath(os.path.abspath(out)), os.path.realpath(os.path.abspath(sum_path))} & src:
+        raise SystemExit("merge output %s would overwrite one of its input tables" % out)
     lam = float(core.lambda_gc(P))
     # per-shard record: the shard's own summary.json (trait, n, transform,
     # software version, key options), when it sits next to the table
@@ -446,10 +578,12 @@ def cmd_merge(a):
     keys = ("trait", "n", "n_anchors", "transform", "covar", "covariates_used", "covariates_dropped",
             "anchor_min", "ld_dmin", "ld_maxspan", "ld_hapcover", "minf", "minc", "kernel_power", "chrom")
     for p in a.tables:
-        sj = p[:-len(".anchors.tsv")] + ".summary.json" if p.endswith(".anchors.tsv") else None
+        sj = _merge_paths(p)[1]          # same naming rule as merge output: a.anchors.tsv, a.tsv, a.b.tsv, a
         rec = dict(table=os.path.realpath(os.path.abspath(p)), table_md5=_md5(p))
         if sj and os.path.exists(sj):
             m_ = json.load(open(sj))
+            if m_.get("status") == "FAILED":
+                raise SystemExit("%s records a FAILED trait (%s); not merged" % (sj, m_.get("reason")))
             rec.update({k: m_.get(k) for k in keys})
             rec["hapdc_version"] = (m_.get("provenance") or {}).get("hapdc_version")
             rec["summary"] = os.path.realpath(os.path.abspath(sj))
@@ -460,8 +594,34 @@ def cmd_merge(a):
         print("WARNING: merging tables of different traits: %s" % traits, flush=True)
     js = dict(tables=[os.path.realpath(os.path.abspath(p)) for p in a.tables], n_anchors=len(rows),
               threshold_bonf=thr, n_sig=int((P < thr).sum()), lambda_gc=lam, alpha=a.alpha, shards=shards,
+              low_precision_tables=[os.path.realpath(os.path.abspath(p)) for p in low_prec],
               provenance=_provenance(a, list(a.tables) + sfiles, roles=["table"] * len(a.tables) + sroles))
-    json.dump(js, open(out[:-len(".anchors.tsv")] + ".summary.json", "w"), indent=1)
+    # Validate all sidecars and compute provenance before touching any output.
+    # Include sidecars in collision checks: out may otherwise overwrite a
+    # differently named input's summary.
+    src.update(os.path.realpath(os.path.abspath(p)) for p in sfiles)
+    if {os.path.realpath(os.path.abspath(out)), os.path.realpath(os.path.abspath(sum_path))} & src:
+        raise SystemExit("merge output would overwrite an input table or summary")
+    table_text = "\t".join(hdr) + "\n" + "".join("\t".join(r) + "\n" for r in rows)
+    summary_text = json.dumps(js, indent=1)
+    # Complete both writes in the output directories before replacing either
+    # destination. Invalid inputs leave existing results byte-for-byte intact.
+    import tempfile
+    staged = []
+    for dest, content in ((out, table_text), (sum_path, summary_text)):
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         prefix=".hapdc-merge-", dir=os.path.dirname(os.path.abspath(dest)),
+                                         delete=False) as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+            staged.append(f.name)
+    os.replace(staged[0], out)
+    os.replace(staged[1], sum_path)
+    if low_prec:
+        print("WARNING: %d table(s) hold P at <= 4 significant digits ; "
+              "anchors next to the threshold may differ from the full-precision decision: %s"
+              % (len(low_prec), ", ".join(low_prec)), flush=True)
     print("merge done: %d anchors, threshold %.3g, %d significant, lambda_gc %.3f -> %s"
           % (len(rows), thr, js["n_sig"], lam, out))
     return 0
@@ -477,22 +637,25 @@ def cmd_report(a):
             continue
         sm = json.load(open(mp))
         for f in sorted(os.listdir(d)):
-            if f.startswith("scan_w") and f.endswith(".npz"):
+            # fixed-width windows (scan_w<width>.npz) and LD units (scan_ld.npz, the default)
+            if (f.startswith("scan_w") or f == "scan_ld.npz") and f.endswith(".npz"):
                 z = np.load(os.path.join(d, f))
                 metas.append((d, f, z, sm))
     if not metas:
-        print("nothing to report")
+        print("nothing to report: no scan_meta.json with scan_ld.npz or scan_w*.npz in %s "
+              "(`report` reads `hapdc scan` output; `hapdc ms` writes its own anchor table and summary)"
+              % ", ".join(a.scans))
         return 1
     for d, f, z, sm in metas:
-        ws = int(z["w_size"])
+        tag = "ld" if f == "scan_ld.npz" else "w%d" % int(z["w_size"])
         for k in ("A_joint", "P1_sidak", "D_acat", "HDCb"):
             key = "P_" + k
             if key not in z:
                 continue
             p = z[key][:, 0]
-            report.write_manhattan_svg(os.path.join(out, "manhattan_%s_w%d.svg" % (k, ws)),
+            report.write_manhattan_svg(os.path.join(out, "manhattan_%s_%s.svg" % (k, tag)),
                                        p, z["starts"], None, label=k)
-            report.write_qq_svg(os.path.join(out, "qq_%s_w%d.svg" % (k, ws)),
+            report.write_qq_svg(os.path.join(out, "qq_%s_%s.svg" % (k, tag)),
                                 p[z["nk"] >= 2], label=k)
     print("report done ->", out)
     return 0
@@ -603,6 +766,9 @@ def main(argv=None):
     q.add_argument("--grm-thin", type=int, default=10, help="with grm=auto: use every k-th marker")
     q.add_argument("out"); q.add_argument("--nmax", type=int, default=None)
     q.add_argument("--miss", default="-9", help="comma separated missing codes")
+    q.add_argument("--skip-unphased", action="store_true",
+                   help="drop markers that carry an unphased heterozygote (0/1) instead of stopping; "
+                        "the number dropped is printed and recorded in meta.json")
     q.set_defaults(func=cmd_prep)
 
     q = sub.add_parser("scan", help="window scan for one trait")
@@ -656,7 +822,10 @@ def main(argv=None):
     q.add_argument("--alpha", type=float, default=0.05)
     q.set_defaults(func=cmd_merge)
 
-    q = sub.add_parser("report", help="tables and SVG figures")
+    q = sub.add_parser("report", help="SVG Manhattan and QQ figures of `scan` output (scan_ld.npz or scan_w*.npz); not for `ms` anchor tables",
+                       description="Reads each SCAN directory written by `hapdc scan` (LD units: scan_ld.npz, the default; "
+                                   "fixed windows: scan_w<width>.npz) and writes Manhattan and QQ SVGs per statistic. "
+                                   "`hapdc ms` output (anchor table and summary.json) is not read by this command.")
     q.add_argument("scans", nargs="+"); q.add_argument("--out", default="report")
     q.set_defaults(func=cmd_report)
 
@@ -669,7 +838,14 @@ def main(argv=None):
     # where os.cpu_count() reports the whole node). Default 1 thread; --threads overrides.
     global _BLAS_LIMIT
     _BLAS_LIMIT = _limit_blas(int(getattr(a, "threads", 0) or 1))
-    return a.func(a)
+    try:
+        return a.func(a)
+    except io.InputError as e:
+        print("error: %s" % e, file=sys.stderr, flush=True)
+        return 1
+    except core.AnalysisFailed as e:
+        print("FAILED: %s" % e, file=sys.stderr, flush=True)
+        return EXIT_FAILED
 
 
 if __name__ == "__main__":

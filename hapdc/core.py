@@ -10,7 +10,8 @@ from scipy import optimize
 
 __all__ = ["windows", "window_design", "reml_delta", "acat", "t2p", "f2p",
            "lmm_scan_additive", "lambda_gc", "ld_blocks", "jitter_blocks",
-           "check_fixed_effects", "FixedEffectRankError"]
+           "check_fixed_effects", "standardize_covariates", "FixedEffectRankError",
+           "AnalysisFailed"]
 
 
 def windows(chrom, w_size, w_step):
@@ -129,6 +130,13 @@ def window_design(H, minf=0.05, minc=5):
     return dict(dos=dos, C=C, nk=nk, ncell=len(order), nrare=nrare,
                 nsmall=int(round(nsmall)))
 
+class AnalysisFailed(ValueError):
+    """The trait cannot be analysed (no phenotypic variation, no residual
+    degrees of freedom, or a non-finite REML quantity or p-value). The CLI
+    reports it as FAILED with a non-zero exit status, never as a completed scan
+    without findings."""
+
+
 class FixedEffectRankError(ValueError):
     """Raised when the fixed-effect design is not of full column rank and the
     caller asked for an error instead of dropping the redundant columns."""
@@ -161,7 +169,19 @@ def _seq_resid(X):
     return out
 
 
-def check_fixed_effects(covar, n, names=None, policy="drop", tol=1e-8):
+def standardize_covariates(C):
+    """Centre each covariate column on its mean and divide by its standard
+    deviation (population form). Returns (Z, mean, sd). Together with the
+    intercept, Z spans the same column space as [1, C], so a fit on [1, Z] gives
+    the same fitted values, residuals and REML estimate as a fit on [1, C], but
+    does not depend on the location or units of the covariates."""
+    C = np.asarray(C, float)
+    mu = C.mean(0)
+    sd = C.std(0)
+    return (C - mu) / np.where(sd > 0, sd, 1.0), mu, sd
+
+
+def check_fixed_effects(covar, n, names=None, policy="drop", tol=1e-8, return_info=False):
     """Check the fixed-effect design [1, covar] before any REML fit.
 
     covar : (n, c) array or None. The intercept is always included and always
@@ -169,24 +189,36 @@ def check_fixed_effects(covar, n, names=None, policy="drop", tol=1e-8):
     names : optional column names (length c), used in messages.
     policy : "drop" removes redundant covariate columns, "error" raises
         FixedEffectRankError naming them.
-    tol : relative rank tolerance on unit-norm columns (the same rule as the
-        column-pivoted basis used by the scan).
+    tol : relative rank tolerance on the singular values of the centred and
+        standardised design.
 
-    Columns are tested in the order given: a covariate is redundant if, after
-    scaling to unit norm, its residual on the intercept and on the covariates
-    kept before it has norm <= tol. The result therefore depends only on the
-    values and the column order the user supplied, not on rounding of a
-    pivoted factorisation. Non-finite values always raise ValueError.
+    The intercept is kept on its own. Every covariate column is centred and
+    divided by its standard deviation before the rank decision, so adding a
+    constant to a column, or changing its units, does not change which columns
+    are kept. A column with zero variance is "constant". The remaining columns
+    are tested in the order given: column j, scaled to unit norm, is redundant
+    when its residual after projecting out the standardised columns kept before
+    it has norm <= max(tol, 64 * eps * max|x_j| / sd_j); the second term is the
+    precision to which a column stored with a large offset resolves its centred
+    values (eps = float64 machine epsilon). The condition number (largest / smallest singular value)
+    of the standardised kept block is reported in the info dict. Non-finite
+    values always raise ValueError.
 
     Returns (covar_kept or None, kept_names, dropped), where dropped is a list
-    of dicts {name, index, reason} with reason "constant" (collinear with the
-    intercept), "duplicate of <name>" or "linear combination of earlier columns".
+    of dicts {name, index, reason} with reason "constant" (no variation in the
+    analysed samples), "duplicate of <name>" (identical after centring and
+    scaling, i.e. an affine copy) or "linear combination of earlier columns".
+    With return_info=True a fourth element gives, per kept column, the mean and
+    standard deviation used and the condition number of the standardised kept
+    block.
     """
+    if policy not in ("drop", "error"):
+        raise ValueError("policy must be 'drop' or 'error'")
     if covar is None:
-        return None, [], []
+        return (None, [], [], {}) if return_info else (None, [], [])
     C = np.asarray(covar, float)
     if C.size == 0:
-        return None, [], []
+        return (None, [], [], {}) if return_info else (None, [], [])
     if C.ndim == 1:
         C = C[:, None]
     if C.shape[0] != n:
@@ -199,29 +231,77 @@ def check_fixed_effects(covar, n, names=None, policy="drop", tol=1e-8):
     if bad:
         raise ValueError("non-finite values in covariate column(s) %s; remove or impute the "
                          "affected samples before the scan" % ", ".join(bad))
-    rr = _seq_resid(np.column_stack([np.ones(n), C]))[1:]
-    kept, dropped = [], []
+    Z, mu, sd = standardize_covariates(C)
+    kept, dropped, basis = [], [], []
     for j in range(c):
-        x = C[:, j]
-        r = rr[j]
-        if r <= tol:
-            if np.ptp(x) == 0:
-                reason = "constant"
-            else:
-                dup = [names[k] for k in kept if np.array_equal(C[:, k], x)]
-                reason = ("duplicate of %s" % dup[0]) if dup else "linear combination of earlier columns"
+        if not sd[j] > 0 or np.ptp(C[:, j]) == 0:
+            dropped.append(dict(name=names[j], index=j, reason="constant"))
+            continue
+        r_ = Z[:, j] / np.sqrt(n)                     # unit norm (mean 0, sd 1)
+        if basis:
+            Q = np.column_stack(basis)
+            r_ = r_ - Q @ (Q.T @ r_)
+            r_ = r_ - Q @ (Q.T @ r_)                  # second pass for orthogonality
+        res = float(np.linalg.norm(r_))
+        # precision floor: a column stored with a large offset resolves its
+        # centred values only to about eps * max|x| / sd
+        tj = max(tol, 64 * np.finfo(float).eps * float(np.abs(C[:, j]).max()) / sd[j])
+        if res <= tj:
+            dup = [names[k] for k in kept
+                   if min(np.linalg.norm(Z[:, k] - Z[:, j]), np.linalg.norm(Z[:, k] + Z[:, j])) / np.sqrt(n)
+                   <= max(tj, 64 * np.finfo(float).eps * float(np.abs(C[:, k]).max()) / sd[k])]
+            reason = ("duplicate of %s" % dup[0]) if dup else "linear combination of earlier columns"
             dropped.append(dict(name=names[j], index=j, reason=reason))
             continue
         kept.append(j)
-    if policy not in ("drop", "error"):
-        raise ValueError("policy must be 'drop' or 'error'")
+        basis.append(r_ / res)
+    cond = 1.0
+    if kept:
+        sv = np.linalg.svd(Z[:, kept] / np.sqrt(n), compute_uv=False)
+        cond = float(sv[0] / sv[-1]) if sv[-1] > 0 else float("inf")
     if dropped and policy == "error":
         raise FixedEffectRankError(
             "fixed-effect design [intercept, covariates] is rank deficient: "
             + "; ".join("%s (%s)" % (d["name"], d["reason"]) for d in dropped))
+    info = dict(transform="centred and divided by the standard deviation (analysed samples)",
+                mean={names[j]: float(mu[j]) for j in kept}, sd={names[j]: float(sd[j]) for j in kept},
+                condition_number_standardised=cond)
     if not kept:
-        return None, [], dropped
-    return C[:, kept], [names[j] for j in kept], dropped
+        return (None, [], dropped, info) if return_info else (None, [], dropped)
+    out = (C[:, kept], [names[j] for j in kept], dropped)
+    return out + (info,) if return_info else out
+
+
+def _gls_profile(yr, S, X2, d):
+    """Weighted least squares on the eigen scale through a QR factorisation.
+
+    w = 1 / (S + d); returns (rss_w, logdet(X' W X)) for the design X2 (n, q),
+    computed from the QR factorisation of W^(1/2) X2 instead of the normal
+    equations, so conditioning is that of W^(1/2) X2, not of its square."""
+    sw = 1.0 / np.sqrt(S + d)
+    A = X2 * sw[:, None]
+    Q, R = np.linalg.qr(A, mode="reduced")
+    yw = yr * sw
+    r = yw - Q @ (Q.T @ yw)
+    return float(r @ r), float(2.0 * np.log(np.abs(np.diag(R))).sum())
+
+
+def _design_rank_ok(X2, tol=1e-10):
+    """Rank check of a rotated design whose first column is the (rotated)
+    intercept: the other columns are projected off the first and scaled to unit
+    norm (the rotated equivalent of centring and scaling), then their smallest
+    singular value must exceed tol times the largest. The tolerance is below the
+    one of check_fixed_effects, so a design accepted there is never refused here;
+    this only guards direct API calls with an exactly singular design."""
+    if X2.shape[1] < 2:
+        return True
+    a = X2[:, 0] / np.linalg.norm(X2[:, 0])
+    B = X2[:, 1:] - np.outer(a, a @ X2[:, 1:])
+    nb = np.linalg.norm(B, axis=0)
+    if (nb <= tol * np.linalg.norm(X2[:, 1:], axis=0)).any():
+        return False
+    sv = np.linalg.svd(B / nb, compute_uv=False)
+    return bool(sv[-1] > tol * sv[0])
 
 
 def _reml_nll(yr, S, Xr):
@@ -229,12 +309,19 @@ def _reml_nll(yr, S, Xr):
     n = len(yr); Xr = np.asarray(Xr, float)
     X2 = Xr[:, None] if Xr.ndim == 1 else Xr
     q = X2.shape[1]
-    def nll(ld):
-        d = np.exp(ld); w = 1.0 / (S + d)
-        Xw = X2 * w[:, None]; XtX = X2.T @ Xw
-        b = np.linalg.solve(XtX, Xw.T @ yr); r = yr - X2 @ b
-        s2 = (w * r * r).sum() / (n - q)
-        return 0.5 * ((n - q) * np.log(s2) + np.log(S + d).sum() + np.linalg.slogdet(XtX)[1])
+    if q == 1:                         # intercept only: a 1 x 1 system, no conditioning issue
+        def nll(ld):
+            d = np.exp(ld); w = 1.0 / (S + d)
+            Xw = X2 * w[:, None]; XtX = X2.T @ Xw
+            b = np.linalg.solve(XtX, Xw.T @ yr); r = yr - X2 @ b
+            s2 = (w * r * r).sum() / (n - q)
+            return 0.5 * ((n - q) * np.log(s2) + np.log(S + d).sum() + np.linalg.slogdet(XtX)[1])
+    else:                              # QR of W^(1/2) X, not the normal equations
+        def nll(ld):
+            d = np.exp(ld)
+            rss, ld_xtx = _gls_profile(yr, S, X2, d)
+            s2 = rss / (n - q)
+            return 0.5 * ((n - q) * np.log(s2) + np.log(S + d).sum() + ld_xtx)
     r = optimize.minimize_scalar(nll, bounds=(-10.0, 10.0), method="bounded")
     return float(r.fun), float(np.exp(r.x))
 
@@ -266,7 +353,7 @@ def reml_delta(yr, S, Xr):
     raises FixedEffectRankError here instead of a bare LinAlgError."""
     n = len(yr)
     Xr = np.asarray(Xr, float)
-    if Xr.ndim == 2 and Xr.shape[1] > 1 and (_seq_resid(Xr) <= 1e-8).any():
+    if Xr.ndim == 2 and Xr.shape[1] > 1 and not _design_rank_ok(Xr):
             raise FixedEffectRankError(
                 "fixed-effect design passed to REML is rank deficient (%d columns); "
                 "run core.check_fixed_effects on the covariates first" % Xr.shape[1])
@@ -284,15 +371,14 @@ def reml_delta(yr, S, Xr):
 
         def nll(ld):
             d = np.exp(ld)
-            w = 1.0 / (S + d)
-            Xw = Xr * w[:, None]
-            XtX = Xr.T @ Xw
-            b = np.linalg.solve(XtX, Xw.T @ yr)
-            r = yr - Xr @ b
-            s2 = (w * r * r).sum() / (n - q)
-            return 0.5 * ((n - q) * np.log(s2) + np.log(S + d).sum() + np.linalg.slogdet(XtX)[1])
+            rss, ld_xtx = _gls_profile(yr, S, Xr, d)
+            s2 = rss / (n - q)
+            return 0.5 * ((n - q) * np.log(s2) + np.log(S + d).sum() + ld_xtx)
 
     r = optimize.minimize_scalar(nll, bounds=(-10.0, 10.0), method="bounded")
+    if not (np.isfinite(r.fun) and np.isfinite(r.x)):
+        raise AnalysisFailed("REML objective is not finite (phenotype without variation, or no "
+                             "residual degrees of freedom)")
     return float(np.exp(r.x))
 
 

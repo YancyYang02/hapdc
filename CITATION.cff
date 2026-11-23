@@ -1,8 +1,7 @@
 cff-version: 1.2.0
 message: "If you use hapdc, please cite it as below."
 title: hapdc
-version: 0.6.6
-date-released: "2026-11-21"
+version: 0.6.8
 license: MIT
 type: software
 authors:
